@@ -1,0 +1,55 @@
+name: Pre-commit
+on:
+  workflow_call:
+    # Map the workflow outputs to job outputs
+    inputs:
+      docker_image:  # id of input
+        description: 'docker_image'
+        required: true
+        type: 'string'
+      docker_username:  # id of input
+        description: 'docker_username'
+        required: true
+        type: 'string'
+    secrets:
+      GH_PKG_RO_PAT:
+        required: true
+    outputs:
+      pre_commit_result:
+        description: "output of precommit "
+        value: ${{ jobs.pre_commit.outputs.pre_commit_result }}
+
+jobs:
+  pre_commit:
+    container:
+      image: ${{ inputs.docker_image }}
+      credentials:
+        username: ${{ inputs.docker_username }}
+        password: ${{ secrets.GH_PKG_RO_PAT }}
+    name: Check changed files
+    outputs:
+      pre_commit_result: ${{ steps.pre_commit.outputs.result }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: "Pre commit hook execution"
+        id: pre_commit
+        if: github.event_name == 'pull_request'
+        run: "pre-commit run --all-files --show-diff-on-failure --color=always"
+        continue-on-error: true
+      - name: Fix pre-commit failure
+        id: fix_pre_commit
+        if: ${{ github.event_name == 'pull_request' && steps.pre_commit.outcome == 'failure' }}
+        run: |
+          git config user.name pre-commit
+          git config user.email pre-commit@github-action
+          git add .
+          git commit -m "commited pre-commit fixes"
+          git push
+

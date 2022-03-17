@@ -1,0 +1,178 @@
+on:
+  workflow_call:
+    inputs:
+      docker_image: # id of input
+        description: "docker_image"
+        required: true
+        type: "string"
+      docker_username: # id of input
+        description: "docker_username"
+        required: true
+        type: "string"
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      AWS_REGION:
+        required: true
+      GH_PKG_RO_PAT:
+        required: true
+      GH_REPO_RO_PAT:
+        required: false
+      TEAMS_WEBHOOK:
+        required: true
+
+jobs:
+  deploy_infra:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.docker_image }}
+      credentials:
+        username: ${{ inputs.docker_username }}
+        password: ${{  secrets.GH_PKG_RO_PAT }}
+    permissions:
+      actions: write
+      checks: write
+      contents: write
+      deployments: write
+      issues: write
+      packages: write
+      pull-requests: write
+      repository-projects: write
+      security-events: write
+      statuses: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Configure AWS credentials for PR role
+        if: github.event_name == 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v1.6.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github_readonly
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Configure AWS credentials for main branch role
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v1.6.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github_readwrite
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Git config
+        env:
+          GH_REPO_RO_PAT: ${{ secrets.GH_REPO_RO_PAT }}
+        if: "${{ env.GH_REPO_RO_PAT != '' }}"
+        run: git config --global url."https://oauth2:${{ secrets.GH_REPO_RO_PAT }}@github.com".insteadOf https://github.com
+      - name: Terragrunt init
+        id: init
+        run: terragrunt run-all init
+      - name: Terragrunt plan
+        if: github.event_name == 'pull_request'
+        id: plan
+        shell: bash
+        run: |
+          set +e
+          exec 9>&1
+          OUTPUT=$(terragrunt run-all plan -detailed-exitcode -out plan.json 2>&1 | tee >(cat - >&9))
+          EXITCODE="${PIPESTATUS[0]}"
+          OUTPUT="${OUTPUT//'%'/'%25'}"
+          OUTPUT="${OUTPUT//$'\n'/'%0A'}"
+          OUTPUT="${OUTPUT//$'\r'/'%0D'}"
+          OUTPUT=$(echo "$OUTPUT" | sed 's/\x1B\[[0-9;]\{1,\}[A-Za-z]//g')
+          echo "::set-output name=stdout::$(echo "$OUTPUT")"
+          echo "EXITCODE: $EXITCODE"
+          if [ $EXITCODE -eq 0 ]; then
+            echo "::set-output name=planresult::unchanged"
+          elif [ $EXITCODE -eq 2 ]; then
+            echo "::set-output name=planresult::success"
+          else
+            echo "::set-output name=planresult::error"
+          fi
+      - name: Terragrunt show plan output
+        uses: mathiasvr/command-output@v1
+        if: github.event_name == 'pull_request' && steps.plan.outputs.planresult == 'success'
+        id: plan_output
+        with:
+          run: terragrunt show -no-color plan.json
+      - name: Comment on PR on success
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request' && steps.plan.outputs.planresult == 'success'
+        env:
+          PLAN: "${{ steps.plan_output.outputs.stdout }}"
+        with:
+          script: |
+            const output = `##### Plan:
+            ###### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            ###### Terraform Plan 📖\`${{ steps.plan.outputs.planresult }}\`
+            <details><summary>Show Plan</summary>
+            \`\`\`terraform\n
+            ${process.env.PLAN}
+            \`\`\`
+            </details>
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      - name: Comment on PR on error
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request' && steps.plan.outputs.planresult == 'error'
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          script: |
+            const output = `##### Plan:
+            ###### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            ###### Terraform Plan 📖\`${{ steps.plan.outputs.planresult }}\`
+            <details><summary>Show Error</summary>
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+            </details>
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      - name: Check Terragrunt Plan
+        if: steps.plan.outputs.planresult == 'error'
+        run: |
+          echo "Terragrunt plan returned ${{ steps.plan.outputs.planresult }}"
+          exit 1
+      - name: Terragrunt apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        id: apply
+        run: terragrunt apply --auto-approve
+      - name: Notify when apply fails
+        if: always() && (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.apply.outcome == 'failure')
+        run: |
+          curl -X POST '${{  secrets.TEAMS_WEBHOOK }}' -d '{
+            "@context": "https://schema.org/extensions",
+            "@type": "MessageCard",
+            "themeColor": "A1051D",
+            "title": "${{ github.repository }} apply has failed",
+            "text": "Author: ${{ github.event.head_commit.author.name }}\n\nCommit: ${{ github.event.head_commit.message }}\n\nClick **View Details** to learn more",
+            "potentialAction": [
+              {
+                "@type": "OpenUri",
+                "name": "View Details",
+                "targets": [
+                  { "os": "default", "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" }
+                ]
+              }
+            ]
+          }'
+      - name: Generate docs
+        if: steps.apply.outcome == 'success'
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/output/
+          terragrunt output --json > output.json
+          terraform-docs markdown table --output-values --output-values-from output.json . > $GITHUB_WORKSPACE/output/Home.md
+      - uses: actions/upload-artifact@v3
+        with:
+          name: output
+          path: output/
+          if-no-files-found: ignore
+

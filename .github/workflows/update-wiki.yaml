@@ -1,0 +1,31 @@
+name: Update wiki
+on:
+  workflow_call:
+
+jobs:
+  wiki:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: output
+          path: output/
+      - name: Clone Github Wiki
+        uses: actions/checkout@v3
+        with:
+          path: "wiki"
+          repository: ${{ github.repository }}.wiki
+      - name: Update wiki page
+        run: |
+          cd $GITHUB_WORKSPACE/wiki
+          cp -r $GITHUB_WORKSPACE/output/*.md .
+          git add .
+          git status
+          git commit --allow-empty -m "Build and publish ${{ github.sha }}"
+          git push origin master
+        env:
+          GIT_AUTHOR_EMAIL: ${{ github.actor }}@users.noreply.github.com
+          GIT_AUTHOR_NAME: ${{ github.actor }}
+          GIT_COMMITTER_EMAIL: ${{ github.actor }}@users.noreply.github.com
+          GIT_COMMITTER_NAME: ${{ github.actor }}
+
